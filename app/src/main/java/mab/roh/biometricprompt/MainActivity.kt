@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Fingerprint
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
@@ -27,7 +29,9 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -53,7 +57,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.room.Room
-import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -62,8 +65,6 @@ import mab.roh.biometricprompt.data.AppDatabase
 import mab.roh.biometricprompt.data.DecryptedNote
 import mab.roh.biometricprompt.data.EncryptedNoteRepository
 import mab.roh.biometricprompt.ui.theme.BiometricPromptTheme
-
-private const val RELOCK_TIMEOUT_MS = 30_000L
 
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,6 +83,11 @@ private enum class LockState {
     UNLOCKED,
 }
 
+private enum class ScreenMode {
+    LIST,
+    EDITOR,
+}
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = Modifier) {
@@ -91,36 +97,92 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
         BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
     val biometricManager = remember(activity) { BiometricManager.from(activity) }
     val repository = remember(activity) {
-        val db =
-            Room.databaseBuilder(activity, AppDatabase::class.java, "secure_notes.db")
-                .fallbackToDestructiveMigration(false)
-                .build()
+        val db = Room.databaseBuilder(activity, AppDatabase::class.java, "secure_notes.db").build()
         EncryptedNoteRepository(db.noteDao(), NoteCryptoManager())
     }
 
     var lockState by rememberSaveable { mutableStateOf(LockState.LOCKED) }
+    var screenMode by rememberSaveable { mutableStateOf(ScreenMode.LIST) }
     var authMessage by rememberSaveable { mutableStateOf("Unlock to view your notes.") }
     var vaultMessage by rememberSaveable { mutableStateOf("Vault ready.") }
     var wasBackgroundedAt by remember { mutableLongStateOf(-1L) }
+
     var notes by remember { mutableStateOf<List<DecryptedNote>>(emptyList()) }
     var isLoadingNotes by remember { mutableStateOf(false) }
+
+    var editingId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var editorTitle by rememberSaveable { mutableStateOf("") }
+    var editorDescription by rememberSaveable { mutableStateOf("") }
 
     val refreshNotes: () -> Unit = {
         scope.launch {
             isLoadingNotes = true
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    repository.loadNotes()
-                }
-            }
+            val result = runCatching { withContext(Dispatchers.IO) { repository.loadNotes() } }
             result.onSuccess { loaded ->
                 notes = loaded
-                vaultMessage = if (loaded.isEmpty()) "No notes yet. Tap Add Note." else "Notes decrypted from local storage."
+                vaultMessage = if (loaded.isEmpty()) "No notes yet. Tap Add Note." else "${loaded.size} note(s) loaded."
             }
             result.onFailure { error ->
                 vaultMessage = "Failed to load notes: ${error.message ?: "unknown error"}"
             }
             isLoadingNotes = false
+        }
+    }
+
+    val openEditor: (Long?) -> Unit = { noteId ->
+        scope.launch {
+            if (noteId == null) {
+                editingId = null
+                editorTitle = ""
+                editorDescription = ""
+                screenMode = ScreenMode.EDITOR
+                return@launch
+            }
+
+            val result = runCatching { withContext(Dispatchers.IO) { repository.loadNoteById(noteId) } }
+            result.onSuccess { note ->
+                if (note == null) {
+                    vaultMessage = "Could not find note."
+                    return@onSuccess
+                }
+                editingId = note.id
+                editorTitle = note.title
+                editorDescription = note.preview
+                screenMode = ScreenMode.EDITOR
+            }
+            result.onFailure { error ->
+                vaultMessage = "Failed to open note: ${error.message ?: "unknown error"}"
+            }
+        }
+    }
+
+    val saveEditor: () -> Unit = save@{
+        val title = editorTitle.trim()
+        val description = editorDescription.trim()
+        if (title.isEmpty()) {
+            vaultMessage = "Title is required."
+            return@save
+        }
+
+        scope.launch {
+            val currentEditingId = editingId
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    if (currentEditingId == null) {
+                        repository.addNote(title = title, preview = description)
+                    } else {
+                        repository.updateNote(id = currentEditingId, title = title, preview = description)
+                    }
+                }
+            }
+            result.onSuccess {
+                vaultMessage = if (currentEditingId == null) "Note created." else "Note updated."
+                screenMode = ScreenMode.LIST
+                refreshNotes()
+            }
+            result.onFailure { error ->
+                vaultMessage = "Failed to save note: ${error.message ?: "unknown error"}"
+            }
         }
     }
 
@@ -159,15 +221,9 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
     val requestUnlock: () -> Unit = {
         when (biometricManager.canAuthenticate(authenticators)) {
             BiometricManager.BIOMETRIC_SUCCESS -> biometricPrompt.authenticate(promptInfo)
-            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE ->
-                authMessage = "No biometric hardware found on this device."
-
-            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE ->
-                authMessage = "Biometric hardware is currently unavailable."
-
-            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED ->
-                authMessage = "No biometric credential enrolled. Use device PIN/pattern."
-
+            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> authMessage = "No biometric hardware found on this device."
+            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> authMessage = "Biometric hardware is currently unavailable."
+            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> authMessage = "No biometric credential enrolled."
             else -> authMessage = "Biometric authentication is not available right now."
         }
     }
@@ -193,12 +249,9 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
 
                 Lifecycle.Event.ON_START -> {
                     if (lockState == LockState.UNLOCKED && wasBackgroundedAt > 0L) {
-                        val wasAwayLongEnough =
-                            SystemClock.elapsedRealtime() - wasBackgroundedAt >= RELOCK_TIMEOUT_MS
-                        if (wasAwayLongEnough) {
-                            lockState = LockState.LOCKED
-                            authMessage = "Session locked after inactivity."
-                        }
+                        lockState = LockState.LOCKED
+                        screenMode = ScreenMode.LIST
+                        authMessage = "Session locked on app return."
                         wasBackgroundedAt = -1L
                     }
                 }
@@ -216,10 +269,20 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
         modifier = modifier.fillMaxSize(),
         topBar = {
             TopAppBar(
-                title = { Text("Secure Notes") },
+                title = { Text(if (screenMode == ScreenMode.EDITOR) "Edit Note" else "Secure Notes") },
+                navigationIcon = {
+                    if (lockState == LockState.UNLOCKED && screenMode == ScreenMode.EDITOR) {
+                        IconButton(onClick = { screenMode = ScreenMode.LIST }) {
+                            Icon(Icons.Rounded.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                },
                 actions = {
                     if (lockState == LockState.UNLOCKED) {
-                        TextButton(onClick = { lockState = LockState.LOCKED }) {
+                        TextButton(onClick = {
+                            lockState = LockState.LOCKED
+                            screenMode = ScreenMode.LIST
+                        }) {
                             Text("Lock")
                         }
                     } else {
@@ -239,38 +302,31 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
                     .padding(innerPadding)
                     .fillMaxSize(),
             )
+            return@Scaffold
+        }
+
+        if (screenMode == ScreenMode.EDITOR) {
+            NoteEditorContent(
+                title = editorTitle,
+                description = editorDescription,
+                onTitleChange = { editorTitle = it },
+                onDescriptionChange = { editorDescription = it },
+                onCancel = { screenMode = ScreenMode.LIST },
+                onSave = saveEditor,
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize(),
+            )
         } else {
             UnlockedNotesContent(
                 notes = notes,
                 vaultMessage = vaultMessage,
                 isLoading = isLoadingNotes,
-                onAddNote = {
-                    scope.launch {
-                        val created = runCatching {
-                            val suffix = Random.nextInt(1000, 9999)
-                            withContext(Dispatchers.IO) {
-                                repository.addNote(
-                                    title = "Secure note #$suffix",
-                                    preview = "Created at ${System.currentTimeMillis()}",
-                                )
-                            }
-                        }
-                        created.onSuccess {
-                            vaultMessage = "Note encrypted and saved."
-                            refreshNotes()
-                        }
-                        created.onFailure { error ->
-                            vaultMessage = "Failed to save note: ${error.message ?: "unknown error"}"
-                        }
-                    }
-                },
+                onAddNote = { openEditor(null) },
+                onEditNote = { noteId -> openEditor(noteId) },
                 onDeleteNote = { id ->
                     scope.launch {
-                        val deleted = runCatching {
-                            withContext(Dispatchers.IO) {
-                                repository.deleteNote(id)
-                            }
-                        }
+                        val deleted = runCatching { withContext(Dispatchers.IO) { repository.deleteNote(id) } }
                         deleted.onSuccess {
                             vaultMessage = "Note deleted."
                             refreshNotes()
@@ -325,17 +381,72 @@ private fun LockedContent(
 }
 
 @Composable
+private fun NoteEditorContent(
+    title: String,
+    description: String,
+    onTitleChange: (String) -> Unit,
+    onDescriptionChange: (String) -> Unit,
+    onCancel: () -> Unit,
+    onSave: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text("Simple and clean note editor", style = MaterialTheme.typography.titleSmall)
+                Text("Enter title and description, then save.", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+
+        OutlinedTextField(
+            value = title,
+            onValueChange = onTitleChange,
+            label = { Text("Title") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+        )
+
+        OutlinedTextField(
+            value = description,
+            onValueChange = onDescriptionChange,
+            label = { Text("Description") },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp),
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            TextButton(onClick = onCancel) {
+                Text("Cancel")
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(onClick = onSave) {
+                Text("Save")
+            }
+        }
+    }
+}
+
+@Composable
 private fun UnlockedNotesContent(
     notes: List<DecryptedNote>,
     vaultMessage: String,
     isLoading: Boolean,
     onAddNote: () -> Unit,
+    onEditNote: (Long) -> Unit,
     onDeleteNote: (Long) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = modifier
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+        modifier = modifier.padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
         Card(
             colors = CardDefaults.cardColors(
@@ -413,8 +524,15 @@ private fun UnlockedNotesContent(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(note.title, style = MaterialTheme.typography.titleSmall)
-                                    TextButton(onClick = { onDeleteNote(note.id) }) {
-                                        Text("Delete")
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        TextButton(onClick = { onEditNote(note.id) }) {
+                                            Icon(Icons.Rounded.Edit, contentDescription = null)
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Edit")
+                                        }
+                                        TextButton(onClick = { onDeleteNote(note.id) }) {
+                                            Text("Delete")
+                                        }
                                     }
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))

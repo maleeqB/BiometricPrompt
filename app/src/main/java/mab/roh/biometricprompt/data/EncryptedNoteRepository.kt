@@ -27,6 +27,15 @@ class EncryptedNoteRepository(
         }
     }
 
+    suspend fun loadNoteById(id: Long): DecryptedNote? {
+        val entity = noteDao.getById(id) ?: return null
+        return DecryptedNote(
+            id = entity.id,
+            title = cryptoManager.decrypt(EncryptedPayload(entity.encryptedTitle, entity.titleIv)),
+            preview = cryptoManager.decrypt(EncryptedPayload(entity.encryptedPreview, entity.previewIv)),
+        )
+    }
+
     suspend fun addNote(title: String, preview: String) {
         val encryptedTitle = cryptoManager.encrypt(title)
         val encryptedPreview = cryptoManager.encrypt(preview)
@@ -38,6 +47,18 @@ class EncryptedNoteRepository(
                 previewIv = encryptedPreview.iv,
                 createdAt = System.currentTimeMillis(),
             ),
+        )
+    }
+
+    suspend fun updateNote(id: Long, title: String, preview: String) {
+        val encryptedTitle = cryptoManager.encrypt(title)
+        val encryptedPreview = cryptoManager.encrypt(preview)
+        noteDao.updateEncrypted(
+            id = id,
+            encryptedTitle = encryptedTitle.cipherText,
+            encryptedPreview = encryptedPreview.cipherText,
+            titleIv = encryptedTitle.iv,
+            previewIv = encryptedPreview.iv,
         )
     }
 
