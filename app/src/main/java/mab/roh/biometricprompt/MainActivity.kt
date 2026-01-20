@@ -39,6 +39,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -51,6 +52,15 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.room.Room
+import kotlin.random.Random
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import mab.roh.biometricprompt.crypto.NoteCryptoManager
+import mab.roh.biometricprompt.data.AppDatabase
+import mab.roh.biometricprompt.data.DecryptedNote
+import mab.roh.biometricprompt.data.EncryptedNoteRepository
 import mab.roh.biometricprompt.ui.theme.BiometricPromptTheme
 
 private const val RELOCK_TIMEOUT_MS = 30_000L
@@ -72,22 +82,47 @@ private enum class LockState {
     UNLOCKED,
 }
 
-private data class NoteItem(
-    val title: String,
-    val preview: String,
-)
-
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = Modifier) {
     val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
     val authenticators =
         BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL
     val biometricManager = remember(activity) { BiometricManager.from(activity) }
+    val repository = remember(activity) {
+        val db =
+            Room.databaseBuilder(activity, AppDatabase::class.java, "secure_notes.db")
+                .fallbackToDestructiveMigration(false)
+                .build()
+        EncryptedNoteRepository(db.noteDao(), NoteCryptoManager())
+    }
 
     var lockState by rememberSaveable { mutableStateOf(LockState.LOCKED) }
     var authMessage by rememberSaveable { mutableStateOf("Unlock to view your notes.") }
+    var vaultMessage by rememberSaveable { mutableStateOf("Vault ready.") }
     var wasBackgroundedAt by remember { mutableLongStateOf(-1L) }
+    var notes by remember { mutableStateOf<List<DecryptedNote>>(emptyList()) }
+    var isLoadingNotes by remember { mutableStateOf(false) }
+
+    val refreshNotes: () -> Unit = {
+        scope.launch {
+            isLoadingNotes = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    repository.loadNotes()
+                }
+            }
+            result.onSuccess { loaded ->
+                notes = loaded
+                vaultMessage = if (loaded.isEmpty()) "No notes yet. Tap Add Note." else "Notes decrypted from local storage."
+            }
+            result.onFailure { error ->
+                vaultMessage = "Failed to load notes: ${error.message ?: "unknown error"}"
+            }
+            isLoadingNotes = false
+        }
+    }
 
     val onAuthenticationSuccess by rememberUpdatedState {
         lockState = LockState.UNLOCKED
@@ -139,6 +174,12 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
 
     LaunchedEffect(Unit) {
         requestUnlock()
+    }
+
+    LaunchedEffect(lockState) {
+        if (lockState == LockState.UNLOCKED) {
+            refreshNotes()
+        }
     }
 
     DisposableEffect(lifecycleOwner, lockState) {
@@ -200,6 +241,45 @@ private fun SecureNotesScreen(activity: FragmentActivity, modifier: Modifier = M
             )
         } else {
             UnlockedNotesContent(
+                notes = notes,
+                vaultMessage = vaultMessage,
+                isLoading = isLoadingNotes,
+                onAddNote = {
+                    scope.launch {
+                        val created = runCatching {
+                            val suffix = Random.nextInt(1000, 9999)
+                            withContext(Dispatchers.IO) {
+                                repository.addNote(
+                                    title = "Secure note #$suffix",
+                                    preview = "Created at ${System.currentTimeMillis()}",
+                                )
+                            }
+                        }
+                        created.onSuccess {
+                            vaultMessage = "Note encrypted and saved."
+                            refreshNotes()
+                        }
+                        created.onFailure { error ->
+                            vaultMessage = "Failed to save note: ${error.message ?: "unknown error"}"
+                        }
+                    }
+                },
+                onDeleteNote = { id ->
+                    scope.launch {
+                        val deleted = runCatching {
+                            withContext(Dispatchers.IO) {
+                                repository.deleteNote(id)
+                            }
+                        }
+                        deleted.onSuccess {
+                            vaultMessage = "Note deleted."
+                            refreshNotes()
+                        }
+                        deleted.onFailure { error ->
+                            vaultMessage = "Failed to delete note: ${error.message ?: "unknown error"}"
+                        }
+                    }
+                },
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize(),
@@ -245,13 +325,14 @@ private fun LockedContent(
 }
 
 @Composable
-private fun UnlockedNotesContent(modifier: Modifier = Modifier) {
-    val demoNotes = listOf(
-        NoteItem("Interview Prep", "BiometricPrompt + Keystore integration notes"),
-        NoteItem("Postgres Ideas", "Device-sync strategy for encrypted metadata"),
-        NoteItem("DevOps", "Release checklist for internal testing build"),
-    )
-
+private fun UnlockedNotesContent(
+    notes: List<DecryptedNote>,
+    vaultMessage: String,
+    isLoading: Boolean,
+    onAddNote: () -> Unit,
+    onDeleteNote: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Column(
         modifier = modifier
             .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -279,7 +360,7 @@ private fun UnlockedNotesContent(modifier: Modifier = Modifier) {
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Text(
-                        text = "Relocks after 30 seconds in the background.",
+                        text = vaultMessage,
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
@@ -297,7 +378,7 @@ private fun UnlockedNotesContent(modifier: Modifier = Modifier) {
                 text = "Recent Notes",
                 style = MaterialTheme.typography.titleMedium,
             )
-            Button(onClick = { }) {
+            Button(onClick = onAddNote) {
                 Text("Add Note")
             }
         }
@@ -306,13 +387,40 @@ private fun UnlockedNotesContent(modifier: Modifier = Modifier) {
         HorizontalDivider()
         Spacer(modifier = Modifier.height(8.dp))
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(demoNotes) { note ->
-                Card {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(note.title, style = MaterialTheme.typography.titleSmall)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(note.preview, style = MaterialTheme.typography.bodySmall)
+        when {
+            isLoading -> {
+                Text(
+                    text = "Loading encrypted notes...",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            notes.isEmpty() -> {
+                Text(
+                    text = "No notes yet. Tap Add Note to create your first encrypted note.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            else -> {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(notes, key = { it.id }) { note ->
+                        Card {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(note.title, style = MaterialTheme.typography.titleSmall)
+                                    TextButton(onClick = { onDeleteNote(note.id) }) {
+                                        Text("Delete")
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(note.preview, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                 }
             }
